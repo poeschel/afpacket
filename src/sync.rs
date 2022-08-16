@@ -1,12 +1,15 @@
 // Derived from the mio-afpacket crate by Alexander Polakov <plhk@sdf.org>,
 // licensed under the MIT license. https://github.com/polachok/mio-afpacket
 
+use std::convert::TryInto;
 use std::io::{Error, ErrorKind, Read, Result, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 
 use libc::{sockaddr_ll, sockaddr_storage, socket, packet_mreq, setsockopt};
-use libc::{AF_PACKET, ETH_P_ALL, SOCK_RAW, SOL_PACKET, SOL_SOCKET, PACKET_MR_PROMISC,
-        SO_ATTACH_FILTER, PACKET_ADD_MEMBERSHIP, PACKET_DROP_MEMBERSHIP, MSG_DONTWAIT};
+use libc::{
+    AF_PACKET, ETH_P_ALL, MSG_DONTWAIT, PACKET_ADD_MEMBERSHIP, PACKET_DROP_MEMBERSHIP,
+    PACKET_MR_PROMISC, SOCK_DGRAM, SOCK_RAW, SOL_PACKET, SOL_SOCKET, SO_ATTACH_FILTER,
+};
 
 /// Packet sockets are used to receive or send raw packets at OSI 2 level.
 #[derive(Debug, Clone)]
@@ -246,5 +249,104 @@ impl Drop for RawPacketStream {
         unsafe {
             libc::close(self.0);
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DgramPacketStream {
+    ifindex: i32,
+    dest: [u8; 8],
+    protocol_nbo: u16,
+    fd: RawFd,
+}
+
+impl DgramPacketStream {
+    pub fn new(ifname: &str, dest: [u8; 8], protocol: u16) -> Result<Self> {
+        let fd = unsafe { socket(AF_PACKET, SOCK_DGRAM, i32::from((ETH_P_ALL as u16).to_be())) };
+        if fd == -1 {
+            return Err(Error::last_os_error());
+        }
+
+        let ifindex = index_by_name(ifname)?;
+        Ok(DgramPacketStream {
+            ifindex,
+            dest,
+            protocol_nbo: protocol.to_be(),
+            fd: fd as RawFd,
+        })
+    }
+
+    pub fn set_ifname(&mut self, ifname: &str) -> Result<()> {
+        self.ifindex = index_by_name(ifname)?;
+        Ok(())
+    }
+
+    pub fn set_dest(&mut self, dest: [u8; 8]) {
+        self.dest = dest;
+    }
+
+    pub fn set_non_blocking(&mut self) -> Result<()> {
+        unsafe {
+            let mut res = libc::fcntl(self.fd, libc::F_GETFL);
+            if res != -1 {
+                res = libc::fcntl(self.fd, libc::F_SETFL, res | libc::O_NONBLOCK);
+            }
+            if res == -1 {
+                return Err(Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn send_to(fd: RawFd, ifindex: i32, dest: [u8; 8], protocol_nbo: u16, buf: &[u8]) -> Result<usize> {
+    let res;
+    unsafe {
+        let mut ss: sockaddr_storage = std::mem::zeroed();
+        let sll: *mut sockaddr_ll = &mut ss as *mut sockaddr_storage as *mut sockaddr_ll;
+        (*sll).sll_halen = dest.len() as u8;
+        (*sll).sll_addr = dest;
+        (*sll).sll_ifindex = ifindex;
+        (*sll).sll_protocol = protocol_nbo;
+
+        let sa = (&ss as *const libc::sockaddr_storage) as *const libc::sockaddr;
+        res = libc::sendto(
+            fd,
+            buf.as_ptr() as *const libc::c_void,
+            buf.len(),
+            0,
+            sa,
+            std::mem::size_of::<sockaddr_ll>() as u32,
+        );
+        if res == -1 {
+            return Err(Error::last_os_error());
+        }
+    }
+    Ok(res.try_into().unwrap())
+}
+
+impl Write for DgramPacketStream {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        send_to(self.fd, self.ifindex, self.dest, self.protocol_nbo, buf)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> Write for &'a DgramPacketStream {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        send_to(self.fd, self.ifindex, self.dest, self.protocol_nbo, buf)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl AsRawFd for DgramPacketStream {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd
     }
 }

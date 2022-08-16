@@ -3,7 +3,9 @@ use std::io::{Read, Write, Result};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::os::unix::prelude::{AsRawFd, FromRawFd, RawFd};
-use super::sync::RawPacketStream as SyncRawPacketStream;
+use super::sync::{
+    DgramPacketStream as SyncDgramPacketStream, RawPacketStream as SyncRawPacketStream,
+};
 pub use super::sync::{Filter, FilterProgram};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -152,5 +154,55 @@ impl AsRawFd for RawPacketStream {
 impl FromRawFd for RawPacketStream {
     unsafe fn from_raw_fd(fd: RawFd) -> RawPacketStream {
         SyncRawPacketStream::from_raw_fd(fd).into()
+    }
+}
+
+#[derive(Debug)]
+pub struct DgramPacketStream {
+    inner: AsyncFd<SyncDgramPacketStream>,
+}
+
+impl DgramPacketStream {
+    pub fn new(ifname: &str, dest: [u8; 8], protocol: u16) -> Result<DgramPacketStream> {
+        let inner = SyncDgramPacketStream::new(ifname, dest, protocol)?;
+        Ok(DgramPacketStream {
+            inner: AsyncFd::new(inner)?,
+        })
+    }
+}
+
+impl AsyncWrite for DgramPacketStream {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize>> {
+        loop {
+            let mut guard = ready!(self.inner.poll_write_ready(cx))?;
+
+            match guard.try_io(|inner| inner.get_ref().write(buf)) {
+                Ok(result) => return Poll::Ready(result),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl From<SyncDgramPacketStream> for DgramPacketStream {
+    fn from(mut sync: SyncDgramPacketStream) -> DgramPacketStream {
+        sync.set_non_blocking().expect("could not set non-blocking");
+        DgramPacketStream {
+            inner: AsyncFd::new(sync).expect("oopsie whoopsie"),
+        }
+    }
+}
+
+impl AsRawFd for DgramPacketStream {
+    fn as_raw_fd(&self) -> RawFd {
+        self.inner.get_ref().as_raw_fd()
     }
 }
